@@ -19,18 +19,32 @@ function Dump-Computers {
 
     .PARAMETER DNSResolve
 
-        Perform reverse DNS lookup to obtain the computers addresses.
+        Perform forward DNS lookup to obtain the computers addresses.
+
+    .PARAMETER QueryDates
+
+        Adds the created and changed dates to each user found.
+
+    .PARAMETER QueryShares
+
+        Asks the target computer what shares it exposes (delays execution and
+        it is quite noisy).
+
+    .PARAMETER QuerySessions
+
+        Asks the target computer what sessions it has (delays execution and
+        it is quite noisy).
 
     .LINK
 
         https://www.serializing.me/tags/active-directory/
 
-    .EXAMPLE 
- 
+    .EXAMPLE
+
         Dump-Computers -DomainFile .\Domains.xml -ResultFile .\Computers.xml
 
-    .EXAMPLE 
- 
+    .EXAMPLE
+
         Dump-Computers -DomainFile .\Domains.xml -ResultFile .\Computers.xml -DNSResolve
 
     .NOTE
@@ -40,7 +54,7 @@ function Dump-Computers {
         License: GPLv3
         Required Dependencies: None
         Optional Dependencies: None
-        Version: 1.0.0
+        Version: 1.0.5
     #>
     [CmdletBinding()]
     param(
@@ -49,8 +63,91 @@ function Dump-Computers {
         [Parameter(Mandatory = $True)]
         [String]$ResultFile,
         [Parameter(Mandatory = $False)]
-        [Switch]$DNSResolve
+        [Switch]$QueryDates,
+        [Parameter(Mandatory = $False)]
+        [Switch]$DNSResolve,
+        [Parameter(Mandatory = $False)]
+        [Switch]$QueryShares,
+        [Parameter(Mandatory = $False)]
+        [Switch]$QuerySessions
     )
+
+    $NetApi = @'
+using System;
+using System.Runtime.InteropServices;
+
+public class NetApi
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct ShareInfo1
+    {
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string netName;
+        [MarshalAs(UnmanagedType.U4)]
+        public uint type;
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string remark;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct SesionInfo10
+    {
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string computerName;
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string userName;
+        [MarshalAs(UnmanagedType.U4)]
+        public uint time;
+        [MarshalAs(UnmanagedType.U4)]
+        public uint idleTime;
+    }
+
+    [DllImport("netapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.U4)]
+    public static extern uint NetShareEnum(
+        [MarshalAs(UnmanagedType.LPWStr)]
+        string serverName,
+        [MarshalAs(UnmanagedType.U4)]
+        uint level,
+        ref IntPtr bufPtr,
+        [MarshalAs(UnmanagedType.U4)]
+        uint prefMaxLen,
+        [MarshalAs(UnmanagedType.U4)]
+        ref uint entriesRead,
+        [MarshalAs(UnmanagedType.U4)]
+        ref uint totalEntries,
+        [MarshalAs(UnmanagedType.U4)]
+        ref uint resumeHandle);
+
+    [DllImport("netapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.U4)]
+    public static extern uint NetSessionEnum(
+        [MarshalAs(UnmanagedType.LPWStr)]
+        string serverName,
+        [MarshalAs(UnmanagedType.LPWStr)]
+        string uncClientName,
+        [MarshalAs(UnmanagedType.LPWStr)]
+        string userName,
+        [MarshalAs(UnmanagedType.U4)]
+        uint level,
+        ref IntPtr bufPtr,
+        [MarshalAs(UnmanagedType.U4)]
+        uint prefMaxLen,
+        [MarshalAs(UnmanagedType.U4)]
+        ref uint entriesRead,
+        [MarshalAs(UnmanagedType.U4)]
+        ref uint totalEntries,
+        [MarshalAs(UnmanagedType.U4)]
+        ref uint resumeHandle);
+
+    [DllImport("netapi32.dll")]
+    [return: MarshalAs(UnmanagedType.U4)]
+    public static extern uint NetApiBufferFree(
+        IntPtr buffer);
+}
+'@
+
+    Add-Type -TypeDefinition $NetApi
 
     function Date-ToString {
         param(
@@ -58,14 +155,23 @@ function Dump-Computers {
             [Bool]$InUTC = $False
         )
 
-        [String]$format = 'yyyy-MM-ddTHH:mm:ss.fffffffZ'
+        [String]$Format = 'yyyy-MM-ddTHH:mm:ss.fffffffZ'
 
         if ($InUTC) {
-            return $Date.ToString($format)
+            return $Date.ToString($Format)
         }
         else {
-            return $Date.ToUniversaltime().ToString($format)
+            return $Date.ToUniversaltime().ToString($Format)
         }
+    }
+
+    function Is-ValidProperty {
+        param(
+            [DirectoryServices.ResultPropertyValueCollection]$Property
+        )
+
+        return ($Property -ne $Null) -and ($Property.Count -eq 1) -and
+                (-not [String]::IsNullOrEmpty($Property.Item(0)))
     }
 
     function BinarySID-ToStringSID {
@@ -79,27 +185,149 @@ function Dump-Computers {
 
     function Forward-Lookup {
         param(
-            [String]$Hostname
+            [String]$HostName
         )
 
         [String[]]$Result = $Null
 
         try {
-            [Net.IPHostEntry]$HostEntry = [Net.DNS]::GetHostEntry($Hostname)
+            [Net.IPHostEntry]$HostEntry = [Net.DNS]::GetHostByName($HostName)
             $Result = $HostEntry.AddressList
         }
         catch {
-            Write-Verbose ('Failed to resolve {0}' -f $Hostname)
+            Write-Verbose ('Failed to forward lookup {0}' -f $HostName)
         }
 
         return $Result
+    }
+
+    function Process-ComputerSession {
+        param(
+            [Xml.XmlWriter]$ResultFileWriter,
+            [Collections.Hashtable]$Computer
+        )
+
+        [IntPtr]$SessionInfos = [IntPtr]::Zero;
+        [IntPtr]$Current = [IntPtr]::Zero;
+        [UInt32]$EntriesRead = 0;
+        [UInt32]$TotalEntries = 0;
+        [UInt32]$ResumeHandle = 0;
+
+        [String]$CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name.ToLower()
+
+        try {
+            if ([NetApi]::NetSessionEnum($Computer.Name, $Null, $Null, 10, [ref]$SessionInfos, [UInt32]::MaxValue,
+                    [ref]$EntriesRead, [ref]$TotalEntries, [ref]$ResumeHandle) -eq 0) {
+
+                # Need to keep the original reference in order to free the buffer.
+                $Current = $SessionInfos;
+
+                if ($EntriesRead -eq 0)
+                {
+                    return
+                }
+
+                $ResultFileWriter.WriteStartElement('Sessions')
+
+                for ([UInt32]$Index = 0; $Index -lt $EntriesRead; $Index++)
+                {
+                    [Netapi+SesionInfo10]$SessionInfo = [Runtime.InteropServices.Marshal]::PtrToStructure(
+                                    $Current, [Netapi+SesionInfo10]);
+
+                    [String]$UserName = $SessionInfo.userName.ToLower()
+
+                    if ($CurrentUser.Contains($UserName)) {
+                        continue
+                    }
+
+                    [String]$ComputerName = $SessionInfo.computerName.ToLower().Trim(@('\'))
+
+                    Write-Verbose ('Found session from {0} at {1}' -f $UserName, $Computer.Name)
+
+                    $ResultFileWriter.WriteStartElement('Session')
+                    $ResultFileWriter.WriteAttributeString('Computer', $ComputerName)
+                    $ResultFileWriter.WriteAttributeString('User', $UserName)
+                    $ResultFileWriter.WriteAttributeString('Time', $SessionInfo.time)
+                    $ResultFileWriter.WriteAttributeString('Idle', $SessionInfo.idleTime)
+                    $ResultFileWriter.WriteEndElement()
+
+                    $Current = [IntPtr]($Current.ToInt64() + [Runtime.InteropServices.Marshal]::SizeOf([Netapi+SesionInfo10]))
+                }
+
+                $ResultFileWriter.WriteEndElement()
+            }
+        }
+        catch {
+            Write-Error $_
+        }
+        finally {
+            if (($SessionInfos -ne [IntPtr]::Zero) -and ([NetApi]::NetApiBufferFree($SessionInfos) -ne 0)) {
+                Write-Warning 'Failed to release the buffer containing the session information'
+            }
+        }
+    }
+
+    function Process-ComputerShare {
+        param(
+            [Xml.XmlWriter]$ResultFileWriter,
+            [Collections.Hashtable]$Computer
+        )
+
+        [IntPtr]$ShareInfos = [IntPtr]::Zero;
+        [IntPtr]$Current = [IntPtr]::Zero;
+        [UInt32]$EntriesRead = 0;
+        [UInt32]$TotalEntries = 0;
+        [UInt32]$ResumeHandle = 0;
+
+        try {
+            if ([NetApi]::NetShareEnum($Computer.Name, 1, [ref]$ShareInfos, [UInt32]::MaxValue,
+                    [ref]$EntriesRead, [ref]$TotalEntries, [ref]$ResumeHandle) -eq 0) {
+
+                # Need to keep the original reference in order to free the buffer.
+                $Current = $ShareInfos;
+
+                if ($EntriesRead -eq 0)
+                {
+                    return
+                }
+
+                $ResultFileWriter.WriteStartElement('Shares')
+
+                for ([UInt32]$Index = 0; $Index -lt $EntriesRead; $Index++)
+                {
+                    [Netapi+ShareInfo1]$ShareInfo = [Runtime.InteropServices.Marshal]::PtrToStructure(
+                                    $Current, [Netapi+ShareInfo1]);
+
+                    Write-Verbose ('Found share {0} in {1}' -f $ShareInfo.netName.ToLower(), $Computer.Name)
+
+                    $ResultFileWriter.WriteStartElement('Share')
+                    $ResultFileWriter.WriteAttributeString('Name', $ShareInfo.netName.ToLower())
+                    $ResultFileWriter.WriteAttributeString('Remark', $ShareInfo.remark)
+                    $ResultFileWriter.WriteEndElement()
+
+                    $Current = [IntPtr]($Current.ToInt64() + [Runtime.InteropServices.Marshal]::SizeOf([Netapi+ShareInfo1]))
+                }
+
+                $ResultFileWriter.WriteEndElement()
+            }
+        }
+        catch {
+            Write-Error $_
+        }
+        finally {
+            if (($ShareInfos -ne [IntPtr]::Zero) -and ([NetApi]::NetApiBufferFree($ShareInfos) -ne 0)) {
+                Write-Warning 'Failed to release the buffer containing the file shares information'
+            }
+        }
     }
 
     function Process-Computer {
         param(
             [Xml.XmlWriter]$ResultFileWriter,
             [Collections.Hashtable]$Computer,
-            [Bool]$DNSResolve
+            [Bool]$DNSResolve,
+            [Bool]$QueryShares,
+            [Bool]$QuerySessions
         )
 
         $ResultFileWriter.WriteStartElement('Computer')
@@ -170,6 +398,23 @@ function Dump-Computers {
             }
         }
 
+        if (($QueryShares -eq $True) -or ($QuerySessions -eq $True)) {
+            $Online = Test-Connection -ComputerName $Computer.Name -Count 1 -TimeToLive 10 -Quiet
+
+            if ($Online -eq $True) {
+                if ($QueryShares -eq $True) {
+                    Process-ComputerShare -ResultFileWriter $ResultFileWriter -Computer $Computer
+                }
+
+                if ($QuerySessions -eq $True) {
+                    Process-ComputerSession -ResultFileWriter $ResultFileWriter -Computer $Computer
+                }
+            }
+            else {
+                Write-Warning ('Computer {0} seems to be down' -f $Computer.Name)
+            }
+        }
+
         $ResultFileWriter.WriteEndElement()
     }
 
@@ -178,18 +423,21 @@ function Dump-Computers {
             [Xml.XmlWriter]$ResultFileWriter,
             [String]$DomainName,
             [String]$DomainDNS,
-            [Bool]$DNSResolve
+            [Bool]$QueryDates,
+            [Bool]$DNSResolve,
+            [Bool]$QueryShares,
+            [Bool]$QuerySessions
         )
 
         Write-Verbose ('Obtaining computers in the {0} domain' -f $DomainName)
 
-        [DirectoryServices.DirectoryEntry]$MainRoot = $Null
+        [DirectoryServices.DirectoryEntry]$DomainRoot = $Null
         [DirectoryServices.DirectorySearcher]$ComputerSearch = $Null
 
         try {
             [DirectoryServices.SortOption]$Sort = New-Object DirectoryServices.SortOption('objectsid',
                     [DirectoryServices.SortDirection]::Ascending);
-        
+
             $DomainRoot = New-Object DirectoryServices.DirectoryEntry @(
                     'LDAP://{0}' -f $DomainName )
 
@@ -207,8 +455,11 @@ function Dump-Computers {
             $ComputerSearch.PropertiesToLoad.Add('operatingsystemversion') | Out-Null
             $ComputerSearch.PropertiesToLoad.Add('operatingsystemservicepack') | Out-Null
             $ComputerSearch.PropertiesToLoad.Add('memberof') | Out-Null
-            $ComputerSearch.PropertiesToLoad.Add('whencreated') | Out-Null
-            $ComputerSearch.PropertiesToLoad.Add('whenchanged') | Out-Null
+
+            if ($QueryDates -eq $True) {
+                $ComputerSearch.PropertiesToLoad.Add('whencreated') | Out-Null
+                $ComputerSearch.PropertiesToLoad.Add('whenchanged') | Out-Null
+            }
 
             [Collections.Hashtable]$Computer = @{
                 'Name' = $Null;
@@ -226,42 +477,34 @@ function Dump-Computers {
             $ComputerSearch.FindAll() | ForEach-Object {
                 # When the property is not null, we assume there is at least
                 # one element in it.
-                if (($_.Properties.dnshostname -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.dnshostname.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.dnshostname) {
                     $Computer.Name = $_.Properties.dnshostname.Item(0).ToLower()
                 }
-                elseif (($_.Properties.cn -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.cn.Item(0)))) {
+                elseif (Is-ValidProperty -Property $_.Properties.cn) {
                     $Computer.Name = ('{0}.{1}' -f $_.Properties.cn.Item(0).ToLower(), $DomainDNS.ToLower())
                 }
-                elseif (($_.Properties.name -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.name.Item(0)))) {
+                elseif (Is-ValidProperty -Property $_.Properties.name) {
                     $Computer.Name = ('{0}.{1}' -f $_.Properties.name.Item(0).ToLower(), $DomainDNS.ToLower())
                 }
-                if ($_.Properties.objectsid -ne $Null) {
+                if (Is-ValidProperty -Property $_.Properties.objectsid) {
                     $Computer.Identifier = BinarySID-ToStringSID -ObjectSID $_.Properties.objectsid.Item(0)
                 }
                 else {
                     $Computer.Identifier = 'S-1-0-0'
                 }
-                if (($_.Properties.description -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.description.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.description) {
                     $Computer.Description = $_.Properties.description.Item(0)
                 }
-                if (($_.Properties.distinguishedname -ne $Null) -and
-                        ($_.Properties.distinguishedname.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.distinguishedname) {
                     $Computer.DN = $_.Properties.distinguishedname.Item(0)
                 }
-                if (($_.Properties.operatingsystem -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.operatingsystem.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.operatingsystem) {
                     $Computer.OSName = $_.Properties.operatingsystem.Item(0)
                 }
-                if (($_.Properties.operatingsystemversion -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.operatingsystemversion.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.operatingsystemversion) {
                     $Computer.OSVersion = $_.Properties.operatingsystemversion.Item(0)
                 }
-                if (($_.Properties.operatingsystemservicepack -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.operatingsystemservicepack.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.operatingsystemservicepack) {
                     $Computer.OSPatch = $_.Properties.operatingsystemservicepack.Item(0)
                 }
                 if ($_.Properties.memberof -ne $Null) {
@@ -269,17 +512,15 @@ function Dump-Computers {
                         $Computer.MemberOf.Add($Item)
                     }
                 }
-                if (($_.Properties.whencreated -ne $Null) -and
-                        ($_.Properties.whencreated.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.whencreated) {
                     $Computer.Created = $_.Properties.whencreated.Item(0)
                 }
-                if (($_.Properties.whenchanged -ne $Null) -and
-                        ($_.Properties.whenchanged.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.whenchanged) {
                     $Computer.Changed = $_.Properties.whenchanged.Item(0)
                 }
 
                 Process-Computer -ResultFileWriter $ResultFileWriter -Computer $Computer `
-                        -DNSResolve $DNSResolve
+                        -DNSResolve $DNSResolve -QueryShares $QueryShares -QuerySessions $QuerySessions
 
                 $Computer.Name = $Null
                 $Computer.Identifier = $Null
@@ -376,7 +617,8 @@ function Dump-Computers {
                 $ResultFileWriter.WriteAttributeString('DNS', $Domain.DNS)
 
                 Process-Domain -ResultFileWriter $ResultFileWriter -DomainName $Domain.Name `
-                        -DomainDNS $Domain.DNS -DNSResolve $DNSResolve
+                        -DomainDNS $Domain.DNS -QueryDates $QueryDates -DNSResolve $DNSResolve `
+                        -QueryShares $QueryShares -QuerySessions $QuerySessions
 
                 $ResultFileWriter.WriteEndElement()
             }

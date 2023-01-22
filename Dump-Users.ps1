@@ -17,12 +17,16 @@ function Dump-Users {
 
         File that will be written with the users.
 
+    .PARAMETER QueryDates
+
+        Adds the created and changed dates to each user found.
+
     .LINK
 
         https://www.serializing.me/tags/active-directory/
 
-    .EXAMPLE 
- 
+    .EXAMPLE
+
         Dump-Users -DomainFile .\Domains.xml -ResultFile .\Users.xml
 
     .NOTE
@@ -32,14 +36,16 @@ function Dump-Users {
         License: GPLv3
         Required Dependencies: None
         Optional Dependencies: None
-        Version: 1.0.1
+        Version: 1.0.5
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $True)]
         [String]$DomainFile,
         [Parameter(Mandatory = $True)]
-        [String]$ResultFile
+        [String]$ResultFile,
+        [Parameter(Mandatory = $False)]
+        [Switch]$QueryDates
     )
 
     function Date-ToString {
@@ -48,14 +54,23 @@ function Dump-Users {
             [Bool]$InUTC = $False
         )
 
-        [String]$format = 'yyyy-MM-ddTHH:mm:ss.fffffffZ'
+        [String]$Format = 'yyyy-MM-ddTHH:mm:ss.fffffffZ'
 
         if ($InUTC) {
-            return $Date.ToString($format)
+            return $Date.ToString($Format)
         }
         else {
-            return $Date.ToUniversaltime().ToString($format)
+            return $Date.ToUniversaltime().ToString($Format)
         }
+    }
+
+    function Is-ValidProperty {
+        param(
+            [DirectoryServices.ResultPropertyValueCollection]$Property
+        )
+
+        return ($Property -ne $Null) -and ($Property.Count -eq 1) -and
+                (-not [String]::IsNullOrEmpty($Property.Item(0)))
     }
 
     function BinarySID-ToStringSID {
@@ -75,16 +90,16 @@ function Dump-Users {
 
         $ResultFileWriter.WriteStartElement('User')
 
-        if (-not [String]::IsNullOrEmpty($User.Name)) {
+        if ($User.Name -ne $Null) {
             $ResultFileWriter.WriteAttributeString('Name', $User.Name)
         }
-        if (-not [String]::IsNullOrEmpty($User.Identifier)) {
+        if ($User.Identifier -ne $Null) {
             $ResultFileWriter.WriteAttributeString('Identifier', $User.Identifier)
         }
-        if (-not [String]::IsNullOrEmpty($User.Description)) {
+        if ($User.Description -ne $Null) {
             $ResultFileWriter.WriteAttributeString('Description', $User.Description)
         }
-        if (-not [String]::IsNullOrEmpty($User.DN)) {
+        if ($User.DN -ne $Null) {
             $ResultFileWriter.WriteAttributeString('DN', $User.DN)
         }
         if ($User.Expires -ne $Null) {
@@ -137,7 +152,8 @@ function Dump-Users {
         param(
             [Xml.XmlWriter]$ResultFileWriter,
             [String]$DomainName,
-            [String]$DomainDNS
+            [String]$DomainDNS,
+            [Bool]$QueryDates
         )
 
         Write-Verbose ('Obtaining users in the {0} domain' -f $DomainName)
@@ -163,8 +179,11 @@ function Dump-Users {
             $UserSearch.PropertiesToLoad.Add('useraccountcontrol') | Out-Null
             $UserSearch.PropertiesToLoad.Add('accountexpires') | Out-Null
             $UserSearch.PropertiesToLoad.Add('memberof') | Out-Null
-            $UserSearch.PropertiesToLoad.Add('whencreated') | Out-Null
-            $UserSearch.PropertiesToLoad.Add('whenchanged') | Out-Null
+
+            if ($QueryDates -eq $True) {
+                $UserSearch.PropertiesToLoad.Add('whencreated') | Out-Null
+                $UserSearch.PropertiesToLoad.Add('whenchanged') | Out-Null
+            }
 
             [Collections.Hashtable]$User = @{
                 'Name' = $Null;
@@ -186,32 +205,27 @@ function Dump-Users {
             }
 
             $UserSearch.FindAll() | ForEach-Object {
-                if (($_.Properties.userprincipalname -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.userprincipalname.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.userprincipalname) {
                     $User.Name = $_.Properties.userprincipalname.Item(0)
                 }
-                if ($_.Properties.objectsid -ne $Null) {
+                if (Is-ValidProperty -Property $_.Properties.objectsid) {
                     $User.Identifier = BinarySID-ToStringSID -ObjectSID $_.Properties.objectsid.Item(0)
                 }
                 else {
                     $User.Identifier = 'S-1-0-0'
                 }
-                if (($_.Properties.description -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.description.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.description) {
                     $User.Description = $_.Properties.description.Item(0)
                 }
-                if (($_.Properties.distinguishedname -ne $Null) -and
-                        ($_.Properties.distinguishedname.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.distinguishedname) {
                     $User.DN = $_.Properties.distinguishedname.Item(0)
                 }
-                if (($_.Properties.accountexpires -ne $Null) -and
-                        ($_.Properties.accountexpires.Item(0) -ne $Null) -and
+                if ((Is-ValidProperty -Property $_.Properties.accountexpires) -and
                         ($_.Properties.accountexpires.Item(0) -ne 0x7FFFFFFFFFFFFFFF)) {
                     $User.Expires = $_.Properties.accountexpires.Item(0)
                     $User.Expired = ($User.Expires -le ((Get-Date).ToFileTimeUTC()))
                 }
-                if (($_.Properties.useraccountcontrol -ne $Null) -and
-                        ($_.Properties.useraccountcontrol.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.useraccountcontrol) {
                     [Int32]$userAccountControl = $_.Properties.useraccountcontrol.Item(0)
 
                     $User.Disabled = (($userAccountControl -band 0x00000002) -eq 0x00000002)
@@ -227,12 +241,10 @@ function Dump-Users {
                         $User.MemberOf.Add($Item)
                     }
                 }
-                if (($_.Properties.whencreated -ne $Null) -and
-                        ($_.Properties.whencreated.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.whencreated) {
                     $User.Created = $_.Properties.whencreated.Item(0)
                 }
-                if (($_.Properties.whenchanged -ne $Null) -and
-                        ($_.Properties.whenchanged.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.whenchanged) {
                     $User.Changed = $_.Properties.whenchanged.Item(0)
                 }
 
@@ -338,7 +350,7 @@ function Dump-Users {
                 $ResultFileWriter.WriteAttributeString('DNS', $Domain.DNS)
 
                 Process-Domain -ResultFileWriter $ResultFileWriter -DomainName $Domain.Name `
-                        -DomainDNS $Domain.DNS
+                        -DomainDNS $Domain.DNS -QueryDates $QueryDates
 
                 $ResultFileWriter.WriteEndElement()
             }

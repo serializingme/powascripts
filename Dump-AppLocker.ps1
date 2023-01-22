@@ -16,9 +16,9 @@ function Dump-AppLocker {
     .LINK
 
         https://www.serializing.me/tags/applocker/
-        
-    .EXAMPLE 
- 
+
+    .EXAMPLE
+
         Dump-AppLocker -ResultFile .\AppLocker.xml
 
     .NOTE
@@ -28,7 +28,7 @@ function Dump-AppLocker {
         License: GPLv3
         Required Dependencies: None
         Optional Dependencies: None
-        Version: 1.0.2
+        Version: 1.0.5
     #>
     [CmdletBinding()]
     param(
@@ -42,29 +42,29 @@ function Dump-AppLocker {
             [Bool]$InUTC = $False
         )
 
-        [String]$format = 'yyyy-MM-ddTHH:mm:ss.fffffffZ'
+        [String]$Format = 'yyyy-MM-ddTHH:mm:ss.fffffffZ'
 
         if ($InUTC) {
-            return $Date.ToString($format)
+            return $Date.ToString($Format)
         }
         else {
-            return $Date.ToUniversaltime().ToString($format)
+            return $Date.ToUniversaltime().ToString($Format)
         }
     }
 
     function Process-PolicyRule {
         param(
             [Xml.XmlWriter]$XmlWriter,
-            [String]$Rule
+            [String]$Path
         )
 
-        Write-Verbose ('Processing policy rule in {0}' -f $Rule)
+        Write-Verbose ('Processing policy rule in {0}' -f $Path)
 
         [IO.StringReader]$StringReader = $Null
         [Xml.XmlReader]$XmlReader = $Null
 
         try {
-            $Property = Get-ItemProperty -Path ('Registry::{0}' -f $Rule) -Name 'Value' `
+            $Property = Get-ItemProperty -Path ('Registry::{0}' -f $Path) -Name 'Value' `
                     -ErrorAction SilentlyContinue
 
             $StringReader = New-Object IO.StringReader @( $Property.Value )
@@ -90,13 +90,13 @@ function Dump-AppLocker {
     function Process-PolicyGroup {
         param(
             [Xml.XmlWriter]$XmlWriter,
-            [String]$Group
+            [String]$Path
         )
 
-        Write-Verbose ('Processing policy group in {0}' -f $Group)
+        Write-Verbose ('Processing policy group in {0}' -f $Path)
 
-        Get-ChildItem -Path ('Registry::{0}' -f $Group) | ForEach-Object {
-            Process-PolicyRule -XmlWriter $XmlWriter -Rule $_.Name
+        Get-ChildItem -Path ('Registry::{0}' -f $Path) | ForEach-Object {
+            Process-PolicyRule -XmlWriter $XmlWriter -Path $_.Name
         }
     }
 
@@ -110,7 +110,7 @@ function Dump-AppLocker {
             $XmlWriter.WriteStartElement('Group')
             $XmlWriter.WriteAttributeString('Name', $_.PSChildName)
 
-            Process-PolicyGroup -XmlWriter $XmlWriter -Group $_.Name
+            Process-PolicyGroup -XmlWriter $XmlWriter -Path $_.Name
 
             $XmlWriter.WriteEndElement()
         }

@@ -13,12 +13,21 @@ function Dump-Domains {
 
         File that will be written with the domains.
 
+    .PARAMETER QueryDates
+
+        Adds the created and changed dates to each domain found.
+
+    .PARAMETER DNSResolve
+
+        Perform reverse DNS lookup to obtain the domain controllers addresses
+        as well as forward DNS lookups to obtain the host names.
+
     .LINK
 
         https://www.serializing.me/tags/active-directory/
 
-    .EXAMPLE 
- 
+    .EXAMPLE
+
         Dump-Domains -DomainFile .\Domains.xml
 
     .NOTE
@@ -28,12 +37,16 @@ function Dump-Domains {
         License: GPLv3
         Required Dependencies: None
         Optional Dependencies: None
-        Version: 1.0.0
+        Version: 1.0.5
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $True)]
-        [String]$ResultFile
+        [String]$ResultFile,
+        [Parameter(Mandatory = $False)]
+        [Switch]$QueryDates,
+        [Parameter(Mandatory = $False)]
+        [Switch]$DNSResolve
     )
 
     function Date-ToString {
@@ -42,20 +55,99 @@ function Dump-Domains {
             [Bool]$InUTC = $False
         )
 
-        [String]$format = 'yyyy-MM-ddTHH:mm:ss.fffffffZ'
+        [String]$Format = 'yyyy-MM-ddTHH:mm:ss.fffffffZ'
 
         if ($InUTC) {
-            return $Date.ToString($format)
+            return $Date.ToString($Format)
         }
         else {
-            return $Date.ToUniversaltime().ToString($format)
+            return $Date.ToUniversaltime().ToString($Format)
+        }
+    }
+
+    function Is-ValidProperty {
+        param(
+            [DirectoryServices.ResultPropertyValueCollection]$Property
+        )
+
+        return ($Property -ne $Null) -and ($Property.Count -eq 1) -and
+                (-not [String]::IsNullOrEmpty($Property.Item(0)))
+    }
+
+    function Forward-Lookup {
+        param(
+            [String]$HostName
+        )
+
+        [String[]]$Result = $Null
+
+        try {
+            [Net.IPHostEntry]$HostEntry = [Net.DNS]::GetHostByName($HostName)
+            $Result = $HostEntry.AddressList
+        }
+        catch {
+            Write-Verbose ('Failed to forward lookup {0}' -f $HostName)
+        }
+
+        return $Result
+    }
+
+    function Reverse-Lookup {
+        param(
+            [String]$Address
+        )
+
+        [String[]]$Result = $Null
+
+        try {
+            [Net.IPHostEntry]$HostEntry = [Net.DNS]::GetHostByAddress($Address)
+            $Result = $HostEntry.HostName
+        }
+        catch {
+            Write-Verbose ('Failed to reverse lookup {0}' -f $Address)
+        }
+
+        return $Result
+    }
+
+    function Perform-DNSResolution {
+        param(
+            [Xml.XmlWriter]$ResultFileWriter,
+            [String]$Hostname
+        )
+
+        [String[]]$Addresses = Forward-Lookup -Hostname $Hostname
+
+        if ($Addresses -ne $Null) {
+            $ResultFileWriter.WriteStartElement('Addresses')
+
+            foreach ($Address in ($Addresses | Sort-Object)) {
+                $ResultFileWriter.WriteStartElement('Address')
+                $ResultFileWriter.WriteAttributeString('Value', $Address)
+
+                [String]$DCName = Reverse-Lookup -Address $Address
+
+                if (-not [String]::IsNullOrEmpty($DCName)) {
+                    $ResultFileWriter.WriteAttributeString('DNS', $DCName)
+
+                    Write-Verbose ('Resolved {1} to {0} ({2})' -f $Address, $Hostname, $DCName)
+                }
+                else {
+                    Write-Verbose ('Resolved {1} to {0}' -f $Address, $Hostname)
+                }
+
+                $ResultFileWriter.WriteEndElement()
+            }
+
+            $ResultFileWriter.WriteEndElement()
         }
     }
 
     function Process-Trusted {
         param(
             [Xml.XmlWriter]$ResultFileWriter,
-            [Collections.Hashtable]$Trusted
+            [Collections.Hashtable]$Trusted,
+            [Bool]$DNSResolve
         )
 
         $ResultFileWriter.WriteStartElement('Trusted')
@@ -67,13 +159,24 @@ function Dump-Domains {
             $ResultFileWriter.WriteAttributeString('DNS', $Trusted.DNS)
         }
 
+        # Peform the DNS resolution if needed.
+        if ($DNSResolve -eq $True) {
+            if ($Trusted.DNS -ne $Null) {
+                Perform-DNSResolution -ResultFileWriter $ResultFileWriter -Hostname $Trusted.DNS
+            }
+            else {
+                Write-Warning 'Unable to perform DNS resolution since the trusted domain does not have a DNS'
+            }
+        }
+
         $ResultFileWriter.WriteEndElement()
     }
 
     function Process-Domain {
         param(
             [Xml.XmlWriter]$ResultFileWriter,
-            [Collections.Hashtable]$Domain
+            [Collections.Hashtable]$Domain,
+            [Bool]$DNSResolve
         )
 
         Write-Verbose ('Processing domain {0}' -f $Domain.Name)
@@ -85,7 +188,7 @@ function Dump-Domains {
             $ResultFileWriter.WriteStartElement('Domain')
             $ResultFileWriter.WriteAttributeString('Name', $Domain.Name)
 
-            if (-not [String]::IsNullOrEmpty($Domain.DNS)) {
+            if ($Domain.DNS -ne $Null) {
                 $ResultFileWriter.WriteAttributeString('DNS', $Domain.DNS)
             }
             if ($Domain.Created -ne $Null) {
@@ -95,6 +198,16 @@ function Dump-Domains {
             if ($Domain.Changed -ne $Null) {
                 $ResultFileWriter.WriteAttributeString('Changed',
                         (Date-ToString -Date $Domain.Changed -InUTC $True))
+            }
+
+            # Peform the DNS resolution if needed.
+            if ($DNSResolve -eq $True) {
+                if ($Domain.DNS -ne $Null) {
+                    Perform-DNSResolution -ResultFileWriter $ResultFileWriter -Hostname $Domain.DNS
+                }
+                else {
+                    Write-Warning 'Unable to perform DNS resolution since the domain does not have a DNS'
+                }
             }
 
             # Get the domain trust relationships.
@@ -113,16 +226,14 @@ function Dump-Domains {
             }
 
             $RelatedSearch.FindAll() | ForEach-Object {
-                if (($_.Properties.flatname -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.flatname.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.flatname) {
                     $Trusted.Name = $_.Properties.flatname.Item(0).ToUpper()
                 }
-                if (($_.Properties.name -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.name.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.name) {
                     $Trusted.DNS = $_.Properties.name.Item(0).ToLower()
                 }
 
-                Process-Trusted -ResultFileWriter $ResultFileWriter -Trusted $Trusted
+                Process-Trusted -ResultFileWriter $ResultFileWriter -Trusted $Trusted -DNSResolve $DNSResolve
 
                 # Make sure the hastable properties are null since it is being
                 # reused.
@@ -147,7 +258,9 @@ function Dump-Domains {
 
     function Process-Domains {
         param(
-            [Xml.XmlWriter]$ResultFileWriter
+            [Xml.XmlWriter]$ResultFileWriter,
+            [Bool]$QueryDates,
+            [Bool]$DNSResolve
         )
 
         [DirectoryServices.DirectoryEntry]$MainRoot = $Null
@@ -167,9 +280,12 @@ function Dump-Domains {
             $DomainSearch.PropertiesToLoad.Add('dnsroot') | Out-Null
             $DomainSearch.PropertiesToLoad.Add('ncname') | Out-Null
             $DomainSearch.PropertiesToLoad.Add('netbiosname') | Out-Null
-            $DomainSearch.PropertiesToLoad.Add('whencreated') | Out-Null
-            $DomainSearch.PropertiesToLoad.Add('whenchanged') | Out-Null
-            
+
+            if ($QueryDates -eq $True) {
+                $DomainSearch.PropertiesToLoad.Add('whencreated') | Out-Null
+                $DomainSearch.PropertiesToLoad.Add('whenchanged') | Out-Null
+            }
+
             [Collections.Hashtable]$Domain = @{
                 'Name' = $Null;
                 'DNS' = $Null;
@@ -180,20 +296,17 @@ function Dump-Domains {
             $DomainSearch.FindAll() | ForEach-Object {
                 $Domain.Name = $_.Properties.netbiosname.Item(0)
 
-                if (($_.Properties.dnsroot -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.dnsroot.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.dnsroot) {
                     $Domain.DNS = $_.Properties.dnsroot.Item(0).ToLower()
-                }     
-                if (($_.Properties.whencreated -ne $Null) -and
-                        ($_.Properties.whencreated.Item(0) -ne $Null)) {
+                }
+                if (Is-ValidProperty -Property $_.Properties.whencreated) {
                     $Domain.Created = $_.Properties.whencreated.Item(0)
                 }
-                if (($_.Properties.whenchanged -ne $Null) -and
-                        ($_.Properties.whenchanged.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.whenchanged) {
                     $Domain.Changed = $_.Properties.whenchanged.Item(0)
                 }
 
-                Process-Domain -ResultFileWriter $ResultFileWriter -Domain $Domain
+                Process-Domain -ResultFileWriter $ResultFileWriter -Domain $Domain -DNSResolve $DNSResolve
 
                 # Make sure the hastable properties are null since it is being
                 # reused.
@@ -222,7 +335,7 @@ function Dump-Domains {
         [IO.FileInfo]$ResultFileInfo = New-Object IO.FileInfo @( $ResultFile )
 
         if ($ResultFileInfo.Exists -eq $True) {
-            Write-Warning 'The file to save the scan results already exists and it will be overwritten'
+            Write-Warning 'The file to save the results already exists and it will be overwritten'
         }
 
         # Instantiate the XML stream and writer.
@@ -238,13 +351,13 @@ function Dump-Domains {
         $ResultFileWriter.WriteAttributeString('Time', (Date-ToString -Date (Get-Date)))
         $ResultFileWriter.WriteEndElement()
 
-        Process-Domains -ResultFileWriter $ResultFileWriter
+        Process-Domains -ResultFileWriter $ResultFileWriter -QueryDates $QueryDates -DNSResolve $DNSResolve
 
         $ResultFileWriter.WriteStartElement('End')
         $ResultFileWriter.WriteAttributeString('Time', (Date-ToString -Date (Get-Date)))
         $ResultFileWriter.WriteEndElement()
     }
-    finally {    
+    finally {
         if ($ResultFileWriter -ne $Null) {
             $ResultFileWriter.Close()
         }

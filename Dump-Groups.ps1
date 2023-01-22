@@ -17,12 +17,16 @@ function Dump-Groups {
 
         File that will be written with the groups.
 
+    .PARAMETER QueryDates
+
+        Adds the created and changed dates to each user found.
+
     .LINK
 
         https://www.serializing.me/tags/active-directory/
 
-    .EXAMPLE 
- 
+    .EXAMPLE
+
         Dump-Groups -DomainFile .\Domains.xml -ResultFile .\Groups.xml
 
     .NOTE
@@ -32,14 +36,16 @@ function Dump-Groups {
         License: GPLv3
         Required Dependencies: None
         Optional Dependencies: None
-        Version: 1.0.0
+        Version: 1.0.5
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $True)]
         [String]$DomainFile,
         [Parameter(Mandatory = $True)]
-        [String]$ResultFile
+        [String]$ResultFile,
+        [Parameter(Mandatory = $False)]
+        [Switch]$QueryDates
     )
 
     function Date-ToString {
@@ -48,14 +54,23 @@ function Dump-Groups {
             [Bool]$InUTC = $False
         )
 
-        [String]$format = 'yyyy-MM-ddTHH:mm:ss.fffffffZ'
+        [String]$Format = 'yyyy-MM-ddTHH:mm:ss.fffffffZ'
 
         if ($InUTC) {
-            return $Date.ToString($format)
+            return $Date.ToString($Format)
         }
         else {
-            return $Date.ToUniversaltime().ToString($format)
+            return $Date.ToUniversaltime().ToString($Format)
         }
+    }
+
+    function Is-ValidProperty {
+        param(
+            [DirectoryServices.ResultPropertyValueCollection]$Property
+        )
+
+        return ($Property -ne $Null) -and ($Property.Count -eq 1) -and
+                (-not [String]::IsNullOrEmpty($Property.Item(0)))
     }
 
     function BinarySID-ToStringSID {
@@ -74,17 +89,17 @@ function Dump-Groups {
         )
 
         $ResultFileWriter.WriteStartElement('Group')
-        
-        if (-not [String]::IsNullOrEmpty($Group.Name)) {
+
+        if ($Group.Name -ne $Null) {
             $ResultFileWriter.WriteAttributeString('Name', $Group.Name)
         }
-        if (-not [String]::IsNullOrEmpty($Group.Identifier)) {
+        if ($Group.Identifier -ne $Null) {
             $ResultFileWriter.WriteAttributeString('Identifier', $Group.Identifier)
         }
-        if (-not [String]::IsNullOrEmpty($Group.Description)) {
+        if ($Group.Description -ne $Null) {
             $ResultFileWriter.WriteAttributeString('Description', $Group.Description)
         }
-        if (-not [String]::IsNullOrEmpty($Group.DN)) {
+        if ($Group.DN -ne $Null) {
             $ResultFileWriter.WriteAttributeString('DN', $Group.DN)
         }
         if ($Group.Created -ne $Null) {
@@ -109,7 +124,8 @@ function Dump-Groups {
         param(
             [Xml.XmlWriter]$ResultFileWriter,
             [String]$DomainName,
-            [String]$DomainDNS
+            [String]$DomainDNS,
+            [Bool]$QueryDates
         )
 
         Write-Verbose ('Obtaining groups in the {0} domain' -f $DomainName)
@@ -135,8 +151,11 @@ function Dump-Groups {
             $GroupSearch.PropertiesToLoad.Add('description') | Out-Null
             $GroupSearch.PropertiesToLoad.Add('distinguishedname') | Out-Null
             $GroupSearch.PropertiesToLoad.Add('memberof') | Out-Null
-            $GroupSearch.PropertiesToLoad.Add('whencreated') | Out-Null
-            $GroupSearch.PropertiesToLoad.Add('whenchanged') | Out-Null
+
+            if ($QueryDates -eq $True) {
+                $GroupSearch.PropertiesToLoad.Add('whencreated') | Out-Null
+                $GroupSearch.PropertiesToLoad.Add('whenchanged') | Out-Null
+            }
 
             [Collections.Hashtable]$Group = @{
                 'Name' = $Null;
@@ -149,32 +168,25 @@ function Dump-Groups {
             }
 
             $GroupSearch.FindAll() | ForEach-Object {
-                # When the property is not null, we assume there is at least
-                # one element in it.
-                if (($_.Properties.name -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.name.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.name) {
                     $Group.Name = $_.Properties.name.Item(0)
                 }
-                elseif (($_.Properties.samaccountname -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.samaccountname.Item(0)))) {
+                elseif (Is-ValidProperty -Property $_.Properties.samaccountname) {
                     $Group.Name = ('{0}' -f $_.Properties.samaccountname.Item(0))
                 }
-                elseif (($_.Properties.cn -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.cn.Item(0)))) {
+                elseif (Is-ValidProperty -Property $_.Properties.cn) {
                     $Group.Name = ('{0}' -f $_.Properties.cn.Item(0))
                 }
-                if ($_.Properties.objectsid -ne $Null) {
+                if (Is-ValidProperty -Property $_.Properties.objectsid) {
                     $Group.Identifier = BinarySID-ToStringSID -ObjectSID $_.Properties.objectsid.Item(0)
                 }
                 else {
                     $Group.Identifier = 'S-1-0-0'
                 }
-                if (($_.Properties.description -ne $Null) -and
-                        (-not [String]::IsNullOrEmpty($_.Properties.description.Item(0)))) {
+                if (Is-ValidProperty -Property $_.Properties.description) {
                     $Group.Description = $_.Properties.description.Item(0)
                 }
-                if (($_.Properties.distinguishedname -ne $Null) -and
-                        ($_.Properties.distinguishedname.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.distinguishedname) {
                     $Group.DN = $_.Properties.distinguishedname.Item(0)
                 }
                 if ($_.Properties.memberof -ne $Null) {
@@ -182,12 +194,10 @@ function Dump-Groups {
                         $Group.MemberOf.Add($Item)
                     }
                 }
-                if (($_.Properties.whencreated -ne $Null) -and
-                        ($_.Properties.whencreated.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.whencreated) {
                     $Group.Created = $_.Properties.whencreated.Item(0)
                 }
-                if (($_.Properties.whenchanged -ne $Null) -and
-                        ($_.Properties.whenchanged.Item(0) -ne $Null)) {
+                if (Is-ValidProperty -Property $_.Properties.whenchanged) {
                     $Group.Changed = $_.Properties.whenchanged.Item(0)
                 }
 
@@ -287,7 +297,7 @@ function Dump-Groups {
                 $ResultFileWriter.WriteAttributeString('DNS', $Domain.DNS)
 
                 Process-Domain -ResultFileWriter $ResultFileWriter -DomainName $Domain.Name `
-                        -DomainDNS $Domain.DNS
+                        -DomainDNS $Domain.DNS -QueryDates $QueryDates
 
                 $ResultFileWriter.WriteEndElement()
             }
