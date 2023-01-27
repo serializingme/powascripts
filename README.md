@@ -5,4 +5,4 @@ This project is a simple repository for all the PowerShell scripts I have develo
 
 ## Licensing
 
-All code is licensed under GPLv3, see [LICENSE](https://github.com/serializingme/powascripts/blob/master/LICENSE.md).
+All code is licensed under GPLv3, see [LICENSE](https://github.com/serializingme/powascripts/blob/master/LICENSE).
