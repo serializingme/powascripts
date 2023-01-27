@@ -1,4 +1,4 @@
-function Dump-Computers {
+﻿function Dump-Computers {
     <#
     .SYNOPSIS
 
@@ -144,6 +144,24 @@ public class NetApi
     [return: MarshalAs(UnmanagedType.U4)]
     public static extern uint NetApiBufferFree(
         IntPtr buffer);
+
+    // Just because some versions of Powershell get confused with the
+    // various overloads.
+    public static SesionInfo10 PtrToSesionInfo10(IntPtr bufPtr) {
+        return Marshal.PtrToStructure<SesionInfo10>(bufPtr);
+    }
+
+    public static int SesionInfo10Size() {
+        return Marshal.SizeOf<SesionInfo10>();
+    }
+
+    public static ShareInfo1 PtrToShareInfo1(IntPtr bufPtr) {
+        return Marshal.PtrToStructure<ShareInfo1>(bufPtr);
+    }
+
+    public static int ShareInfo1Size() {
+        return Marshal.SizeOf<ShareInfo1>();
+    }
 }
 '@
 
@@ -231,8 +249,7 @@ public class NetApi
 
                 for ([UInt32]$Index = 0; $Index -lt $EntriesRead; $Index++)
                 {
-                    [Netapi+SesionInfo10]$SessionInfo = [Runtime.InteropServices.Marshal]::PtrToStructure(
-                                    $Current, [Netapi+SesionInfo10]);
+                    [Netapi+SesionInfo10]$SessionInfo = [NetApi]::PtrToSesionInfo10($Current);
 
                     [String]$UserName = $SessionInfo.userName.ToLower()
 
@@ -251,7 +268,7 @@ public class NetApi
                     $ResultFileWriter.WriteAttributeString('Idle', $SessionInfo.idleTime)
                     $ResultFileWriter.WriteEndElement()
 
-                    $Current = [IntPtr]($Current.ToInt64() + [Runtime.InteropServices.Marshal]::SizeOf([Netapi+SesionInfo10]))
+                    $Current = [IntPtr]($Current.ToInt64() + [NetApi]::SesionInfo10Size())
                 }
 
                 $ResultFileWriter.WriteEndElement()
@@ -295,8 +312,7 @@ public class NetApi
 
                 for ([UInt32]$Index = 0; $Index -lt $EntriesRead; $Index++)
                 {
-                    [Netapi+ShareInfo1]$ShareInfo = [Runtime.InteropServices.Marshal]::PtrToStructure(
-                                    $Current, [Netapi+ShareInfo1]);
+                    [Netapi+ShareInfo1]$ShareInfo = [NetApi]::PtrToShareInfo1($Current);
 
                     Write-Verbose ('Found share {0} in {1}' -f $ShareInfo.netName.ToLower(), $Computer.Name)
 
@@ -305,7 +321,7 @@ public class NetApi
                     $ResultFileWriter.WriteAttributeString('Remark', $ShareInfo.remark)
                     $ResultFileWriter.WriteEndElement()
 
-                    $Current = [IntPtr]($Current.ToInt64() + [Runtime.InteropServices.Marshal]::SizeOf([Netapi+ShareInfo1]))
+                    $Current = [IntPtr]($Current.ToInt64() + [NetApi]::ShareInfo1Size())
                 }
 
                 $ResultFileWriter.WriteEndElement()
@@ -398,7 +414,7 @@ public class NetApi
             }
         }
 
-        if (($QueryShares -eq $True) -or ($QuerySessions -eq $True)) {
+        if ($QueryShares -eq $True -or $QuerySessions -eq $True) {
             $Online = Test-Connection -ComputerName $Computer.Name -Count 1 -TimeToLive 10 -Quiet
 
             if ($Online -eq $True) {
@@ -542,7 +558,12 @@ public class NetApi
                 $ComputerSearch.Dispose()
             }
             if ($DomainRoot -ne $Null) {
-                $DomainRoot.Dispose()
+                try {
+                    $DomainRoot.Dispose()
+                }
+                catch {
+                    Write-Warning 'Failed to dispose the domain root, probably because the server is not operational'
+                }
             }
         }
     }
