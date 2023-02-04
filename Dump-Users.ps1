@@ -275,7 +275,12 @@ function Dump-Users {
                 $UserSearch.Dispose()
             }
             if ($DomainRoot -ne $Null) {
-                $DomainRoot.Dispose()
+                try {
+                    $DomainRoot.Dispose()
+                }
+                catch {
+                    Write-Warning 'Failed to dispose the domain root, probably because the server is not operational'
+                }
             }
         }
     }

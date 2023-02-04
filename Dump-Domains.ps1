@@ -323,7 +323,12 @@ function Dump-Domains {
                 $PartitionsRoot.Dispose()
             }
             if ($MainRoot -ne $Null) {
-                $MainRoot.Dispose()
+                try {
+                    $MainRoot.Dispose()
+                }
+                catch {
+                    Write-Warning 'Failed to dispose the main root, probably because the server is not operational'
+                }
             }
         }
     }
